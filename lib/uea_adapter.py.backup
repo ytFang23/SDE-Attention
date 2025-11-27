@@ -1,0 +1,328 @@
+# lib/uea_adapter.py
+import os
+import pathlib
+import shutil
+import zipfile
+import urllib.request
+from collections import OrderedDict
+from typing import Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sktime.datasets import load_from_tsfile_to_dataframe
+
+from . import utils
+
+here = pathlib.Path(__file__).resolve().parent
+
+
+def _data_root() -> pathlib.Path:
+    """
+    Where to store/read UEA datasets.
+    - Preferred: <project_root>/data/UEA
+    - Override with env UEA_DATA_ROOT
+    """
+    env = os.environ.get("UEA_DATA_ROOT")
+    if env:
+        return pathlib.Path(env).expanduser().resolve()
+    return (here.parent / "data" / "UEA").resolve()  # <-- OUTSIDE lib/
+
+
+def _old_data_root() -> pathlib.Path:
+    """The previous location (inside lib/) for auto-migration."""
+    return (here / "data" / "UEA").resolve()
+
+
+def _uea_base_dir() -> pathlib.Path | None:
+    base = _data_root()
+    c1 = base / "Multivariate2018_ts"
+    c2 = base / "Multivariate_ts"
+    if c1.exists(): return c1
+    if c2.exists(): return c2
+    return None
+
+
+def _migrate_if_needed():
+    """
+    If data exists in the old lib/data/UEA location, move it to the new
+    <project_root>/data/UEA once. Safe if already migrated.
+    """
+    new = _data_root()
+    old = _old_data_root()
+    if not old.exists():
+        return
+    new.mkdir(parents=True, exist_ok=True)
+    # Move everything from old -> new (files & folders)
+    for p in old.iterdir():
+        target = new / p.name
+        if target.exists():
+            continue
+        if p.is_dir():
+            shutil.move(str(p), str(target))
+        else:
+            shutil.move(str(p), str(target))
+    # Try to remove the now-empty old path
+    try:
+        old.rmdir()
+    except OSError:
+        pass
+
+
+def _ensure_uea_data():
+    """
+    Ensure the UEA archive is present and extracted under _data_root().
+    Also runs a one-time migration from the old location.
+    """
+    _migrate_if_needed()  # <-- NEW
+    base = _data_root()
+    base.mkdir(parents=True, exist_ok=True)
+
+    if _uea_base_dir() is not None:
+        return
+
+    url = "http://www.timeseriesclassification.com/aeon-toolkit/Archives/Multivariate2018_ts.zip"
+    zip_path = base / "Multivariate2018_ts.zip"
+    print(f"[UEA] Downloading: {url} -> {zip_path}")
+    urllib.request.urlretrieve(url, str(zip_path))
+    print(f"[UEA] Extracting: {zip_path} -> {base}")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(str(base))
+    if _uea_base_dir() is None:
+        raise FileNotFoundError(
+            "[UEA] extracted, but dataset folder not found (expect Multivariate2018_ts/ or Multivariate_ts/)."
+        )
+
+
+def _load_uea_raw(name: str):
+    _ensure_uea_data()
+    base_dir = _uea_base_dir()
+    assert base_dir is not None
+    base = base_dir / name / name
+    tr_path = str(base) + "_TRAIN.ts"
+    te_path = str(base) + "_TEST.ts"
+    Xtr_df, ytr = load_from_tsfile_to_dataframe(tr_path)
+    Xte_df, yte = load_from_tsfile_to_dataframe(te_path)
+    return (Xtr_df.to_numpy(), np.array(ytr)), (Xte_df.to_numpy(), np.array(yte))
+
+
+def _pad_stack(X_list: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+    B = len(X_list)
+    D = len(X_list[0])
+
+    T_max = 0
+    for sample in X_list:
+        for d in range(D):
+            T_max = max(T_max, len(sample[d]))
+    T_max = int(T_max)
+
+    X = torch.zeros(B, T_max, D, dtype=torch.float32)
+    M = torch.zeros(B, T_max, D, dtype=torch.float32)
+
+    for i, sample in enumerate(X_list):
+        for d in range(D):
+            ch = torch.as_tensor(sample[d], dtype=torch.float32)
+            T_d = len(ch)
+            X[i, :T_d, d] = ch
+            M[i, :T_d, d] = 1.0
+
+    return X, M
+
+
+def _map_labels_to_int(y: np.ndarray) -> Tuple[torch.Tensor, OrderedDict]:
+    table = OrderedDict()
+    idxs = []
+    for lab in y:
+        if lab not in table:
+            table[lab] = len(table)
+        idxs.append(table[lab])
+    return torch.tensor(idxs, dtype=torch.long), table
+
+
+class UeaDataset(Dataset):
+    def __init__(self, X: torch.Tensor, M: torch.Tensor, y: torch.Tensor):
+        """
+        X: (B,T,D), M: (B,T,D), y: (B,)
+        """
+        self.X = X
+        self.M = M
+        self.y = y
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, i):
+        return self.X[i], self.M[i], self.y[i]
+
+
+def _make_collate_fn(time_steps: torch.Tensor, n_classes: int, args, device, data_type: str):
+    """
+    ⚠️ 关键修改：将整数标签转换为 one-hot 编码
+    """
+
+    def collate(batch):
+        X, M, Y = zip(*batch)  # list of (T,D), ...
+        X = torch.stack(X, 0)  # (B,T,D)
+        M = torch.stack(M, 0)  # (B,T,D)
+        Y = torch.stack(Y, 0)  # (B,) - 整数标签
+
+        # === 关键修改：转换为 one-hot 编码 ===
+        Y_onehot = torch.zeros(Y.size(0), n_classes, dtype=torch.float32)
+        Y_onehot.scatter_(1, Y.unsqueeze(1), 1.0)  # (B, n_classes)
+        # =====================================
+
+        data_dict = {
+            "data": X.to(device),
+            "time_steps": time_steps.to(device),
+            "mask": M.to(device),
+            "labels": Y_onehot.to(device),  # 使用 one-hot 编码
+        }
+
+        data_dict = utils.split_and_subsample_batch(data_dict, args, data_type=data_type)
+        return data_dict
+
+    return collate
+
+
+def build_uea_dataloaders(
+        name: str,
+        batch_size: int = 64,
+        missing_rate: float = 0.0,
+        missing_scheme: str = "per-value",
+        device: torch.device = torch.device("cpu"),
+        num_workers: int = 0,
+        args=None,
+):
+    """
+    Build UEA dataloaders with optional missing data simulation
+
+    Args:
+        name: UEA dataset name
+        batch_size: Batch size
+        missing_rate: Fraction of values to drop (0.0 = no missing, 0.3 = 30% missing)
+        missing_scheme: How to create missingness:
+            - "per-value": Drop individual values randomly (MCAR)
+            - "per-time": Drop entire time steps
+            - "per-dim": Drop entire features/dimensions
+        device: torch device
+        num_workers: Number of workers for dataloader
+        args: Additional arguments
+    """
+
+    (Xtr_np, ytr_np), (Xte_np, yte_np) = _load_uea_raw(name)
+    Xtr, Mtr = _pad_stack(Xtr_np)  # (B,T,D)
+    Xte, Mte = _pad_stack(Xte_np)
+
+    T = Xtr.shape[1]
+    time_steps = torch.linspace(0, T - 1, T, dtype=torch.float32)
+
+    # ========== Apply Missing Data ==========
+    if missing_rate > 0.0:
+        print(f"[UEA] Applying missing rate: {missing_rate:.2%} (scheme: {missing_scheme})")
+
+        original_obs_train = Mtr.sum().item()
+        original_obs_test = Mte.sum().item()
+
+        if missing_scheme == "per-value":
+            # MCAR: Missing Completely At Random - drop individual values
+            # Keep probability = 1 - missing_rate
+            keep_prob = 1.0 - missing_rate
+
+            # Only drop from originally observed values (respect padding)
+            drop_mask_tr = (torch.rand_like(Mtr) < keep_prob).float()
+            drop_mask_te = (torch.rand_like(Mte) < keep_prob).float()
+
+            Mtr = Mtr * drop_mask_tr  # Keep original padding
+            Mte = Mte * drop_mask_te
+
+        elif missing_scheme == "per-time":
+            # Drop entire time steps across all dimensions
+            B_tr, T_tr, D_tr = Mtr.shape
+            B_te, T_te, D_te = Mte.shape
+
+            keep_prob = 1.0 - missing_rate
+
+            # Generate time-level dropout: (B, T, 1)
+            drop_mask_tr = (torch.rand(B_tr, T_tr, 1) < keep_prob).float()
+            drop_mask_te = (torch.rand(B_te, T_te, 1) < keep_prob).float()
+
+            # Broadcast to all dimensions
+            drop_mask_tr = drop_mask_tr.expand(B_tr, T_tr, D_tr)
+            drop_mask_te = drop_mask_te.expand(B_te, T_te, D_te)
+
+            Mtr = Mtr * drop_mask_tr
+            Mte = Mte * drop_mask_te
+
+        elif missing_scheme == "per-dim":
+            # Drop entire dimensions/features across all time
+            B_tr, T_tr, D_tr = Mtr.shape
+            B_te, T_te, D_te = Mte.shape
+
+            keep_prob = 1.0 - missing_rate
+
+            # Generate dimension-level dropout: (B, 1, D)
+            drop_mask_tr = (torch.rand(B_tr, 1, D_tr) < keep_prob).float()
+            drop_mask_te = (torch.rand(B_te, 1, D_te) < keep_prob).float()
+
+            # Broadcast to all time steps
+            drop_mask_tr = drop_mask_tr.expand(B_tr, T_tr, D_tr)
+            drop_mask_te = drop_mask_te.expand(B_te, T_te, D_te)
+
+            Mtr = Mtr * drop_mask_tr
+            Mte = Mte * drop_mask_te
+
+        else:
+            raise ValueError(f"Unknown missing_scheme: {missing_scheme}")
+
+        # Zero out dropped values
+        Xtr = Xtr * Mtr
+        Xte = Xte * Mte
+
+        # Report statistics
+        new_obs_train = Mtr.sum().item()
+        new_obs_test = Mte.sum().item()
+
+        actual_missing_train = 1.0 - (new_obs_train / original_obs_train)
+        actual_missing_test = 1.0 - (new_obs_test / original_obs_test)
+
+        print(f"[UEA] Train: {original_obs_train:.0f} → {new_obs_train:.0f} obs "
+              f"({actual_missing_train:.2%} missing)")
+        print(f"[UEA] Test:  {original_obs_test:.0f} → {new_obs_test:.0f} obs "
+              f"({actual_missing_test:.2%} missing)")
+
+    ytr, table = _map_labels_to_int(ytr_np)
+    yte = torch.tensor([table.get(lab, -1) for lab in yte_np], dtype=torch.long)
+    assert (yte >= 0).all(), "Test set contains unseen labels from training set."
+    n_classes = len(table)
+
+    train_ds = UeaDataset(Xtr, Mtr, ytr)
+    test_ds = UeaDataset(Xte, Mte, yte)
+
+    collate_train = _make_collate_fn(time_steps, n_classes, args, device, data_type="train")
+    collate_test = _make_collate_fn(time_steps, n_classes, args, device, data_type="test")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=min(batch_size, len(train_ds)),
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_train,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=len(test_ds),
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_test,
+    )
+
+    data_objects = {
+        "train_dataloader": utils.inf_generator(train_loader),
+        "test_dataloader": utils.inf_generator(test_loader),
+        "input_dim": Xtr.shape[-1],
+        "n_train_batches": len(train_loader),
+        "n_test_batches": len(test_loader),
+        "classif_per_tp": False,
+        "n_labels": n_classes,
+    }
+    return data_objects
