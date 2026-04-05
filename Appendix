@@ -1,0 +1,196 @@
+\begin{listing}[p]
+\caption{Constructing $f_\theta$ with a two-layer neural network}
+\label{lst:odefunc}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+import torch
+import torch.nn as nn
+from torchdiffeq import odeint_adjoint as odeint
+class ODEFunc(nn.Module):
+    def __init__(self, dim):
+        super().__init__()         
+        self.net = nn.Sequential(     
+            nn.Linear(dim, 50),       
+            nn.Tanh(),                
+            nn.Linear(50, dim),      
+            dim
+        )
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0, std=0.1)   
+                nn.init.constant_(m.bias, val=0)           
+    def forward(self, t, h):
+        return self.net(h)  
+
+class ODEBlock(nn.Module):
+    def __init__(self, odefunc, t0=0.0, t1=1.0, method='rk4', tol=1e-3):
+        super().__init__()            
+        self.odefunc = odefunc      
+        self.register_buffer('t', torch.tensor([t0, t1]))
+        self.method = method        
+        self.tol = tol     
+
+    def forward(self, h0):
+        hT = odeint(
+            self.odefunc,
+            h0,
+            self.t,
+            rtol=self.tol,
+            atol=self.tol,
+            method=self.method
+        )
+        return hT[1]                 
+\end{minted}
+\end{listing}
+
+\begin{listing}[p]
+\ContinuedFloat
+\caption[]{Constructing $f_\theta$ with a two-layer neural network (continued)}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+class NeuralODE(nn.Module):
+    def __init__(self, dim):
+        super().__init__()            
+        self.fc_in = nn.Linear(2, dim)       
+        self.odeblock = ODEBlock(ODEFunc(dim)) 
+        self.fc_out = nn.Linear(dim, 2)    
+        
+    def forward(self, x):
+        h0 = torch.relu(self.fc_in(x))      
+        hT = self.odeblock(h0)               
+        return self.fc_out(hT)               
+\end{minted}
+\end{listing}
+
+\begin{listing}[p]
+\caption{Neural SDE using ELBO as loss function}
+\label{lst:Neural SDEs(ELBO)}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+class NDE_model(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, activation='lipswish', vector_field=None):
+        super(NDE_model, self).__init__()
+        self.func = vector_field(input_dim, hidden_dim, hidden_dim, num_layers, activation=activation)
+        self.initial = nn.Linear(input_dim, hidden_dim)
+        self.mu_layer = nn.Linear(hidden_dim, hidden_dim) 
+        self.logvar_layer = nn.Linear(hidden_dim, hidden_dim) 
+        self.decoder = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, coeffs, times):
+        ## Control module
+        self.func.set_X(coeffs, times)
+
+        y0 = self.func.X.evaluate(times[0])
+        y0 = self.initial(y0)
+
+        z = torchsde.sdeint(sde=self.func,
+                            y0=y0,
+                            ts=times,
+                            dt=0.05,
+                            method='euler')
+        z = z.permute(1,0,2)
+
+        ## Reparameterization trick
+        mu = self.mu_layer(z)
+        logvar = self.logvar_layer(z)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = eps.mul(std).add_(mu)  
+        
+        return self.decoder(z), mu, logvar
+\end{minted}
+\end{listing}
+
+\begin{listing}[p]
+\ContinuedFloat
+\caption[]{Neural SDE using ELBO as loss function(continued)}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+def elbo_loss(recon_x, x, mu, logvar, weight=1e-2):
+    MSE = F.mse_loss(recon_x, x, reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return MSE + weight * KLD
+\end{minted}
+\end{listing}
+
+\begin{listing}[htbp]
+\caption{Neural SDE using MSE as loss function}
+\label{lst:Neural SDEs(MSE)}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+class NeuralSDEFunc(nn.Module):
+    def __init__(self, input_dim, hidden_dim, hidden_hidden_dim, num_layers, activation='lipswish'):
+        super(NeuralSDEFunc, self).__init__()
+        self.sde_type = "ito"
+        self.noise_type = "diagonal" # or "scalar"
+
+        self.linear_in = nn.Linear(hidden_dim + 1, hidden_dim)
+        self.f_net = MLP(hidden_dim, hidden_dim, hidden_hidden_dim, num_layers, activation=activation)
+        self.linear_out = nn.Linear(hidden_dim, hidden_dim)
+        self.noise_in = nn.Linear(hidden_dim + 1, hidden_dim)
+        self.g_net = MLP(hidden_dim, hidden_dim, hidden_hidden_dim, num_layers, activation=activation)
+
+    def set_X(self, coeffs, times):
+        self.coeffs = coeffs
+        self.times = times
+        self.X = torchcde.CubicSpline(self.coeffs, self.times)
+    
+    def f(self, t, y):
+        if t.dim() == 0:
+            t = torch.full_like(y[:, 0], fill_value=t).unsqueeze(-1)
+        # yy = self.linear_in(torch.cat((torch.sin(t), torch.cos(t), y), dim=-1))
+        yy = self.linear_in(torch.cat((t, y), dim=-1))
+        return self.f_net(yy)
+
+    def g(self, t, y):
+        if t.dim() == 0:
+            t = torch.full_like(y[:, 0], fill_value=t).unsqueeze(-1)
+        # yy = self.noise_in(torch.cat((torch.sin(t), torch.cos(t), y), dim=-1))
+        yy = self.noise_in(torch.cat((t, y), dim=-1))
+        return self.g_net(yy) 
+\end{minted}
+\end{listing}
+
+\begin{listing}[p]
+\ContinuedFloat
+\caption[]{Neural SDE using MSE as loss function(continued)}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+class NDE_model(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, activation='lipswish', vector_field=None):
+        super(NDE_model, self).__init__()
+        self.func = vector_field(input_dim, hidden_dim, hidden_dim, num_layers, activation=activation)
+        self.initial = nn.Linear(input_dim, hidden_dim)
+        self.decoder = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, coeffs, times):
+        # control module
+        self.func.set_X(coeffs, times)
+
+        y0 = self.func.X.evaluate(times[0])
+        y0 = self.initial(y0)
+
+        z = torchsde.sdeint(sde=self.func,
+                            y0=y0,
+                            ts=times,
+                            dt=0.05,
+                            method='euler')
+        z = z.permute(1,0,2)
+        return self.decoder(z)
+\end{minted}
+\end{listing}
+
+\begin{listing}[htbp]
+\caption{Interpolation}
+\label{lst:Interpolation}
+\begin{minted}[breaklines=true, frame=lines, framesep=2mm]{python}
+def generate_data(num_samples, T, N, theta, mu, sigma, X0):
+    data_list = []
+    for _ in range(num_samples):
+        t, X = ou_process(T, N, theta, mu, sigma, X0)
+        data_list.append([t, X])
+
+    total_data = torch.Tensor(np.array(data_list))  
+    total_data = total_data.permute(0, 2, 1) 
+    
+    max_len = total_data.shape[1]
+    times = torch.linspace(0, 1, max_len)
+    coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(total_data, times)
+
+    return total_data, coeffs, times
+\end{minted}
+\end{listing}
