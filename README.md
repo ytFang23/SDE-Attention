@@ -1,322 +1,242 @@
-# SDE-RNN with Latent-Level Attention Mechanisms
+# Latent ODEs for Irregularly-Sampled Time Series
 
-A PyTorch implementation of Stochastic Differential Equation Recurrent Neural Networks (SDE-RNN) enhanced with multiple attention mechanisms for time series classification and imputation with missing data.
+An extended implementation of Latent ODE models for irregularly-sampled time series, built on top of the original work by Rubanova et al. (2019). This repository adds **SDE-RNN**, **latent-level attention mechanisms**, and benchmark support for UCR/UEA time series classification archives.
+
+> **Base paper**: Yulia Rubanova, Ricky Chen, David Duvenaud. *"Latent ODEs for Irregularly-Sampled Time Series"* (NeurIPS 2019). [[arXiv]](https://arxiv.org/abs/1907.03907)
+
+<p align="center">
+<img align="middle" src="./assets/viz.gif" width="800" />
+</p>
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Key Extensions](#key-extensions)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Models](#models)
+- [Datasets](#datasets)
+- [Attention Mechanisms](#attention-mechanisms)
+- [CLI Reference](#cli-reference)
+- [Citation](#citation)
+
+---
 
 ## Overview
 
-This project extends the original Latent ODE framework with **latent-level attention mechanisms** specifically designed for irregular time series with missing observations. Unlike input-level attention, our mechanisms operate in the learned latent space, capturing temporal dynamics more effectively.
+This codebase supports training and evaluating continuous-time sequence models on both **reconstruction** and **classification** tasks with irregularly-sampled or partially observed time series. Missing data is handled natively via observation masks.
 
-### Key Contributions
-- ✅ **Three novel latent-level attention mechanisms**: Pyramidal, TVF-LSTM, TVF-Transformer
-- ✅ **Comprehensive missing data simulation**: Per-value, per-time, per-dimension schemes
-- ✅ **Large-scale evaluation**: 20 UCR datasets × 4 attention variants × 4 missing rates × 4 seeds
-- ✅ **Production-ready codebase**: Automated batch processing, result collection, statistical analysis
+**Core idea**: Encode a time series into a latent initial state using a recognition network (ODE-RNN or RNN), then decode the trajectory by solving an ODE/SDE forward in time — enabling interpolation, extrapolation, and generation at arbitrary time points.
 
-## Features
+---
 
-### Attention Mechanisms (Latent-Level)
-- **Channel Attention**: Learn cross-channel dependencies in latent representations
-- **Pyramidal Attention**: Multi-scale temporal patterns with 3-level hierarchy
-- **TVF-LSTM Attention**: Sequential temporal feature weighting
-- **TVF-Transformer Attention**: Self-attention based temporal modeling
+## Key Extensions
 
-### Supported Models
-- **SDE-RNN**: Our main model with SDE-based dynamics
-- **ODE-RNN**: Deterministic variant
-- **Latent ODE**: VAE with ODE/SDE solvers
-- **RNN Baselines**: GRU, LSTM with decay
+Beyond the original Latent ODE paper, this repository includes:
 
-### Datasets
-- **UCR Archive**: 128 univariate classification datasets (auto-downloaded)
-- **UEA Archive**: 30 multivariate classification datasets (auto-downloaded)
-- **Synthetic**: Configurable periodic time series generator
+| Feature | Description |
+|---|---|
+| **SDE-RNN** | Stochastic Differential Equation RNN with latent noise for uncertainty modeling |
+| **Channel Attention** | Learns global importance weights per feature dimension on latent states |
+| **Pyramidal Attention** | Multi-scale transformer attention blocks over latent trajectories |
+| **Time-Varying Feature (TVF) Attention** | Per-time-step feature weights via LSTM or Transformer |
+| **Conditional Attention Mixture (CAM)** | Data-driven routing of sequences to the best-matching attention expert |
+| **UCR Benchmark** | Support for 128+ UCR univariate time series classification datasets |
+| **UEA Benchmark** | Support for UEA multivariate time series classification datasets |
+| **Missing Data Simulation** | MCAR, per-time, and per-dimension missing data schemes |
+| **W&B Logging** | Integrated Weights & Biases experiment tracking |
 
-### Missing Data Handling
-- **MCAR (Per-value)**: Missing Completely At Random
-- **Per-time**: Missing entire time steps (temporal gaps)
-- **Per-dimension**: Missing entire features (sensor failures)
-- **Configurable rates**: 0%, 30%, 60%, 90%
+---
 
 ## Installation
+
+**Requirements**: Python 3.8+, PyTorch 2.x
+
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/sde-rnn-attention
-cd sde-rnn-attention
-
-# Install dependencies
-pip install torch numpy scipy scikit-learn sktime torchsde torchdiffeq
-
-# Datasets will auto-download on first use
+git clone https://github.com/<your-username>/latent_ode.git
+cd latent_ode
+pip install -r requirements.txt
 ```
 
-**Requirements:**
-- Python 3.8+
-- PyTorch 1.10+
-- CUDA (optional, for GPU acceleration)
+Key dependencies: `torch >= 2.0`, `torchdiffeq >= 0.2.5`, `torchsde >= 0.2.6`, `numpy`, `pandas`, `scikit-learn`, `matplotlib`.
+
+---
 
 ## Quick Start
 
-### 1. Single Experiment
+**Toy dataset** (1D periodic functions):
+```bash
+python run_models.py --niters 500 -n 1000 -s 50 -l 10 \
+    --dataset periodic --latent-ode --noise-weight 0.01
+```
 
-**Baseline (no attention)**
+**UCR classification**:
 ```bash
 python run_models.py \
-    --dataset ucr \
-    --ucr-dataset Coffee \
-    --sde-rnn \
-    --classif \
-    --niters 100 \
-    --random-seed 42
+    --dataset ucr --ucr-dataset GunPoint \
+    --sde-rnn --classif \
+    --niters 200 --batch-size 32 --lr 0.001
 ```
 
-**With Pyramidal Latent Attention**
+---
+
+## Models
+
+| Flag | Model | Description |
+|---|---|---|
+| `--latent-ode` | Latent ODE | VAE with ODE-RNN encoder (Rubanova et al., 2019) |
+| `--latent-ode --z0-encoder rnn` | Latent ODE (RNN enc.) | VAE with standard RNN encoder (Chen et al., 2018) |
+| `--latent-ode --poisson` | Latent ODE + Poisson | Adds Poisson process likelihood for observation times |
+| `--ode-rnn` | ODE-RNN | RNN with ODE transitions between observations |
+| `--sde-rnn` | SDE-RNN | RNN with stochastic ODE transitions (this work) |
+| `--rnn-vae` | RNN-VAE | VAE with standard RNN encoder/decoder |
+| `--classic-rnn` | Classic RNN | Baseline GRU/RNN |
+| `--classic-rnn --input-decay --rnn-cell expdecay` | GRU-D | GRU with exponential decay for missing data |
+
+---
+
+## Datasets
+
+### Original Datasets
+
+Raw data is downloaded automatically on first run.
+
+**MuJoCo (Hopper)**:
+```bash
+python run_models.py --niters 300 -n 10000 -l 15 \
+    --dataset hopper --latent-ode \
+    --rec-dims 30 --gru-units 100 --units 300 \
+    --gen-layers 3 --rec-layers 3
+```
+
+**PhysioNet**:
+```bash
+python run_models.py --niters 100 -n 8000 -l 20 \
+    --dataset physionet --latent-ode \
+    --rec-dims 40 --rec-layers 3 --gen-layers 3 \
+    --units 50 --gru-units 50 --quantization 0.016 --classif
+```
+
+**Human Activity**:
+```bash
+python run_models.py --niters 200 -n 10000 -l 15 \
+    --dataset activity --latent-ode \
+    --rec-dims 100 --rec-layers 4 --gen-layers 2 \
+    --units 500 --gru-units 50 --classif --linear-classif
+```
+
+### UCR Archive (128+ univariate datasets)
+
+Data is auto-downloaded (~500 MB) on first use.
+
+```bash
+# Basic training
+python run_models.py \
+    --dataset ucr --ucr-dataset GunPoint \
+    --sde-rnn --classif --niters 200
+
+# With 30% MCAR missing data
+python run_models.py \
+    --dataset ucr --ucr-dataset GunPoint \
+    --sde-rnn --classif \
+    --ucr-missing-rate 0.3 --ucr-missing-scheme per-value
+```
+
+**Missing data schemes** (`--ucr-missing-scheme`):
+- `per-value` — MCAR: each observation independently dropped
+- `per-time` — Entire time steps dropped
+- `per-dim` — Per dimension (equivalent to per-value for univariate data)
+
+### UEA Archive (multivariate datasets)
+
 ```bash
 python run_models.py \
-    --dataset ucr \
-    --ucr-dataset Coffee \
-    --sde-rnn \
-    --classif \
-    --pyramidal-latent-attention \
-    --attention-levels 3 \
-    --attention-hidden-dim 32 \
-    --niters 100
+    --dataset uea --uea-dataset BasicMotions \
+    --sde-rnn --classif --niters 200
 ```
 
-**With Missing Data**
+---
+
+## Attention Mechanisms
+
+All attention modules operate on the **latent trajectory** inside SDE-RNN.
+
+| Flag | Mechanism | Description |
+|---|---|---|
+| `--use-channel-latent-attention` | Channel Attention | Global importance weight per feature dimension |
+| `--use-pyramidal-latent-attention` | Pyramidal Attention | Multi-scale transformer attention over latent states |
+| `--use-tvf-latent-attention` | Time-Varying Feature | Per-time-step feature weights (LSTM or Transformer) |
+| `--use-conditional-attention-mixture` | CAM | Routes each sequence to the best-matching attention expert |
+
+**TVF method** can be selected with `--tvf-method lstm` (default) or `--tvf-method transformer`.
+
+### Conditional Attention Mixture (CAM)
+
+CAM is a mixture-of-experts module. A gating network extracts rich time series statistics (temporal, frequency, statistical, shape, and missingness features) to dynamically route each input to one of three expert attention modules. It includes an expert diversity loss and a dominance warm-up phase (`--cam-dominance-warmup`).
+
+---
+
+## CLI Reference
+
+### Core arguments
+
+| Argument | Description |
+|---|---|
+| `-n INT` | Number of training samples |
+| `-s INT` | Number of time steps (toy dataset) |
+| `-l / --latents INT` | Latent dimension size |
+| `--niters INT` | Training iterations |
+| `-b / --batch-size INT` | Batch size |
+| `--lr FLOAT` | Learning rate |
+| `--rec-dims INT` | Recognition model dimension |
+| `--rec-layers INT` | Recognition model depth |
+| `--gen-layers INT` | Generative model depth |
+| `--gru-units INT` | GRU hidden units |
+| `--units INT` | ODE/SDE network hidden units |
+| `--classif` | Enable classification head |
+| `--linear-classif` | Use linear classifier (vs. MLP) |
+| `--noise-weight FLOAT` | Observation noise weight |
+| `--random-seed INT` | Random seed |
+
+### KL regularization
+
+| Argument | Description |
+|---|---|
+| `--use-kld` | Enable KL divergence regularization |
+| `--kl-base FLOAT` | Base KL coefficient (default: 1.0) |
+| `--kl-warmup-epochs INT` | Epochs with zero KL weight |
+| `--kl-anneal-epochs INT` | Epochs to anneal KL weight |
+
+### W&B logging
+
 ```bash
-python run_models.py \
-    --dataset ucr \
-    --ucr-dataset Coffee \
-    --sde-rnn \
-    --classif \
-    --pyramidal-latent-attention \
-    --ucr-missing-rate 0.3 \
-    --ucr-missing-scheme per-value \
-    --niters 100
+python run_models.py ... \
+    --wandb --wandb-project my-project --wandb-entity my-team
 ```
 
-### 2. Batch Experiments (Reproducibility)
+### Visualization
 
-**Run all 20 datasets with 4 seeds**
 ```bash
-# Baseline
-python run_all_ucr.py --variant baseline --multi-seed --seeds 4
-
-# Pyramidal attention
-python run_all_ucr.py --variant pyramidal_latent --multi-seed --seeds 4
-
-# TVF-LSTM attention
-python run_all_ucr.py --variant tvf_lstm_latent --multi-seed --seeds 4
-
-# TVF-Transformer attention
-python run_all_ucr.py --variant tvf_transformer_latent --multi-seed --seeds 4
+python run_models.py --niters 100 -n 5000 -b 100 -l 3 \
+    --dataset periodic --latent-ode --noise-weight 0.5 \
+    --lr 0.01 --viz --rec-layers 2 --gen-layers 2 -u 100 -c 30
 ```
 
-**Test multiple missing rates**
-```bash
-python run_all_ucr.py \
-    --variant pyramidal_latent \
-    --miss-rates 0.0 0.3 0.6 0.9 \
-    --ucr-missing-scheme per-value \
-    --multi-seed \
-    --seeds 4
-```
-
-**Custom dataset subset**
-```bash
-python run_all_ucr.py \
-    --variant pyramidal_latent \
-    --datasets Coffee ECG200 Wafer \
-    --multi-seed
-```
-
-## Command-Line Arguments
-
-### Essential Arguments
-```bash
---dataset {ucr,uea,periodic}     # Dataset type
---ucr-dataset NAME               # Specific UCR dataset (e.g., Coffee)
---sde-rnn                        # Use SDE-RNN model
---classif                        # Classification task
-```
-
-### Attention Configuration
-```bash
-# Pyramidal Attention
---pyramidal-latent-attention     # Enable pyramidal attention
---attention-levels N             # Number of pyramid levels (default: 3)
-
-# TVF Attention  
---tvf-latent-attention           # Enable TVF attention
---tvf-method {lstm,transformer}  # TVF implementation
-
-# Channel Attention
---channel-latent-attention       # Enable channel attention
-
-# Shared
---attention-hidden-dim N         # Hidden dimension for attention (default: 32)
-```
-
-### Missing Data Simulation
-```bash
---ucr-missing-rate R             # Missing rate [0.0-1.0] (default: 0.0)
---ucr-missing-scheme S           # {per-value, per-time, per-dim}
-```
-
-### Model Hyperparameters
-```bash
---latents N                      # Latent dimension (default: 25)
---gru-units N                    # GRU hidden units (default: 100)
---units N                        # Decoder hidden units (default: 100)
---batch-size N                   # Batch size (default: 32)
---kl-coef K                      # KL coefficient (default: 1.0)
-```
-
-### Training
-```bash
---niters N                       # Training iterations (default: 100)
---random-seed N                  # Random seed (default: 42)
---lr R                           # Learning rate (default: 1e-3)
-```
-
-### Batch Script (`run_all_ucr.py`)
-```bash
---variant {baseline, pyramidal_latent, tvf_lstm_latent, ...}
---multi-seed                     # Enable multi-seed experiments
---seeds N                        # Number of seeds (default: 3)
---seed-list 42 2023 777          # Custom seed list
---miss-rates 0.0 0.3 0.6         # Multiple missing rates
---datasets D1 D2 D3              # Subset of datasets
---exclude D4 D5                  # Exclude datasets
---timeout N                      # Per-run timeout in seconds
-```
-
-## Tested Datasets
-
-**UCR Datasets (20 total):**
-```
-Coffee, ECG200, ECGFiveDays, Earthquakes, ItalyPowerDemand,
-Lightning2, MoteStrain, ProximalPhalanxOutlineAgeGroup,
-ProximalPhalanxOutlineCorrect, ProximalPhalanxTW, Car,
-SmoothSubspace, SonyAIBORobotSurface2, Strawberry, 
-SyntheticControl, TwoPatterns, Wafer, MiddlePhalanxOutlineAgeGroup
-```
-
-All datasets auto-download on first use.
-
-## Output Structure
-```
-ucr_results_<variant>_<timestamp>/
-├── config.json                          # Experiment configuration
-├── results.json                         # All run results
-└── <variant>_<dataset>_miss<R>_seed<N>/
-    ├── <experiment>.log                 # Training logs
-    ├── model.pth                        # Saved checkpoint
-    └── metrics.json                     # Per-epoch metrics
-```
-
-**Example `results.json`:**
-```json
-[
-  {
-    "dataset": "Coffee",
-    "seed": 42,
-    "miss_rate": 0.3,
-    "variant": "pyramidal_latent",
-    "status": "success",
-    "time": 125.3,
-    "final_accuracy": 0.9286
-  }
-]
-```
-
-## Project Structure
-```
-.
-├── lib/
-│   ├── sde_rnn.py                  # SDE-RNN with latent attention support
-│   ├── pyramidal_attention.py      # Pyramidal attention module
-│   ├── attention_mechanisms.py     # Channel & TVF attention
-│   ├── encoder_decoder.py          # Encoder with attention integration
-│   ├── ucr_adapter.py              # UCR dataset loader
-│   ├── uea_adapter.py              # UEA dataset loader
-│   ├── diffeq_solver.py            # ODE/SDE solvers
-│   ├── base_models.py              # Base model classes
-│   └── utils.py                    # Utility functions
-├── run_models.py                   # Single experiment runner
-├── run_all_ucr.py                  # Batch experiment script
-└── README.md
-```
-
-## Reproducibility
-
-All experiments use fixed seeds and deterministic settings:
-- Default seeds: `[42, 2023, 777, 9999]`
-- PyTorch deterministic mode enabled
-- CUDA deterministic algorithms when available
-
-**Reproduce paper results:**
-```bash
-# Run all experiments (20 datasets × 4 variants × 4 seeds × 4 missing rates = 1280 runs)
-for variant in baseline pyramidal_latent tvf_lstm_latent tvf_transformer_latent; do
-    python run_all_ucr.py \
-        --variant $variant \
-        --miss-rates 0.0 0.3 0.6 0.9 \
-        --multi-seed \
-        --seeds 4
-done
-```
-
-## Performance Notes
-
-**Training Time (per dataset):**
-- Baseline: ~2-5 minutes
-- With attention: ~3-8 minutes
-- Large datasets (e.g., ElectricDevices): 15-30 minutes
-
-**GPU Recommended:**
-- Batch experiments benefit from GPU acceleration
-- CPU mode works but slower (~3x)
+---
 
 ## Citation
 
-This work builds on:
+If you use this code, please cite the original paper:
+
 ```bibtex
 @inproceedings{rubanova2019latent,
-  title={Latent ODEs for Irregularly-Sampled Time Series},
-  author={Rubanova, Yulia and Chen, Ricky TQ and Duvenaud, David},
-  booktitle={NeurIPS},
-  year={2019}
+  title     = {Latent Ordinary Differential Equations for Irregularly-Sampled Time Series},
+  author    = {Rubanova, Yulia and Chen, Ricky T. Q. and Duvenaud, David},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2019}
 }
 ```
 
-If you use this code, please cite:
-```bibtex
-@software{SDE-Attention,
-  title={SDE-RNN with Latent-Level Attention for Time Series Classification},
-  author={Yuting Fang},
-  year={2025},
-  url={https://github.com/ytfang23/SDE-Attention}
-}
-```
-
-## License
-
-MIT License - See LICENSE file for details.
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request with tests
-
-## Contact
-
-- Issues: [GitHub Issues](https://github.com/ytfang23/SDE-Attention/issues)
-- Email: z5518340@ad.unsw.edu.au
-## Acknowledgments
-
-- Original Latent ODE implementation by Yulia Rubanova
-- UCR/UEA Time Series Archives
-- PyTorch and torchsde teams
+Original implementation: [YuliaRubanova/latent_ode](https://github.com/YuliaRubanova/latent_ode)
